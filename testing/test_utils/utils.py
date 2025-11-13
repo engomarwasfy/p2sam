@@ -34,6 +34,19 @@ def point_selection(mask_sim, topk=1):
     return topk_xy, topk_label, last_xy, last_label
 
 
+def smooth_mask(mask_array, method='none', kernel_size=5, sigma=1.0):
+    if method == 'none':
+        return mask_array
+    k = max(1, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    mask_float = mask_array.astype(np.float32)
+    if method == 'gaussian':
+        smoothed = cv2.GaussianBlur(mask_float, (k, k), sigma)
+        return smoothed > 0.5
+    return mask_array
+
+
 def compute_wasserstein_distance(A, B, B_weights=None):
     A_np = A.detach().cpu().numpy()
     B_np = B.detach().cpu().numpy()
@@ -227,6 +240,14 @@ def run_medical(args, sam, test_image_path, test_mask_path, output_path, slice_n
 
     # Save masks 
     final_mask = masks[best_idx]
+    smoothing_method = getattr(args, "mask_smoothing", "none")
+    if smoothing_method != "none":
+        final_mask = smooth_mask(
+            final_mask,
+            method=smoothing_method,
+            kernel_size=getattr(args, "mask_smoothing_kernel", 5),
+            sigma=getattr(args, "mask_smoothing_sigma", 1.0),
+        )
     mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
     mask_colors[final_mask, :] = np.array([[0, 0, 128]])
     mask_output_path = os.path.join(output_path, slice_name + '.png')

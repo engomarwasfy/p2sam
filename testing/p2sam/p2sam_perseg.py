@@ -33,6 +33,9 @@ def get_arguments():
     parser.add_argument('--max-num-pos', type=int, default=1)
     parser.add_argument('--min-num-pos', type=int, default=1)
     parser.add_argument('--reg-patch-weight', action='store_true')
+    parser.add_argument('--mask-smoothing', type=str, default='none', choices=['none', 'gaussian'])
+    parser.add_argument('--mask-smoothing-kernel', type=int, default=5)
+    parser.add_argument('--mask-smoothing-sigma', type=float, default=1.0)
 
     # vis for a specific case
     parser.add_argument('--vis', action='store_true')
