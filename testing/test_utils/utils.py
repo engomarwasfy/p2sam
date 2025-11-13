@@ -34,6 +34,62 @@ def point_selection(mask_sim, topk=1):
     return topk_xy, topk_label, last_xy, last_label
 
 
+def _aggregate_target_vector(feat_map, mask, method="mean_max"):
+    """Aggregate masked features into a single vector."""
+    if mask.numel() == 0:
+        return None
+    mask_bool = mask > 0
+    mask_pixels = feat_map[mask_bool]
+    if mask_pixels.shape[0] == 0:
+        return None
+    if method == "mean":
+        return mask_pixels.mean(0)
+    if method == "max":
+        return torch.max(mask_pixels, dim=0)[0]
+    if method == "mean_max":
+        feat_mean = mask_pixels.mean(0)
+        feat_max = torch.max(mask_pixels, dim=0)[0]
+        return 0.5 * feat_mean + 0.5 * feat_max
+    return mask_pixels.mean(0)
+
+
+def _normalize_vector(vec, eps=1e-6):
+    denom = vec.norm(dim=-1, keepdim=True).clamp(min=eps)
+    return vec / denom
+
+
+def _compute_similarity(target_feat, feat_map):
+    c, h, w = feat_map.shape
+    feat_norm = feat_map / (feat_map.norm(dim=0, keepdim=True) + 1e-8)
+    sim = target_feat @ feat_norm.reshape(c, h * w)
+    return sim.reshape(1, 1, h, w)
+
+
+def _prepare_mask_from_image(mask_image, size_hw, device):
+    if mask_image.ndim == 3:
+        mask_gray = cv2.cvtColor(mask_image, cv2.COLOR_RGB2GRAY)
+    else:
+        mask_gray = mask_image
+    mask_tensor = torch.from_numpy(mask_gray.astype(np.float32) / 255.0).to(device)
+    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+    mask_tensor = F.interpolate(mask_tensor, size=size_hw, mode="bilinear", align_corners=False)
+    mask_tensor = mask_tensor.squeeze()
+    return mask_tensor
+
+
+def _smooth_mask(mask_array, method='none', kernel_size=5, sigma=1.0):
+    if method == 'none':
+        return mask_array
+    k = max(1, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    mask_float = mask_array.astype(np.float32)
+    if method == 'gaussian':
+        smoothed = cv2.GaussianBlur(mask_float, (k, k), sigma)
+        return smoothed > 0.5
+    return mask_array
+
+
 def compute_wasserstein_distance(A, B, B_weights=None):
     A_np = A.detach().cpu().numpy()
     B_np = B.detach().cpu().numpy()
@@ -457,12 +513,47 @@ def p2sam_medical(args, sam, ref_image_path, ref_mask_path, test_image_path, tes
 # p2sam for perseg
 def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_path, output_path):
     predictor = SamPredictor(sam)
+    device = predictor.device
 
     # Load images and masks
     ref_image = cv2.imread(ref_image_path)
     ref_image = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
     ref_mask = cv2.imread(ref_mask_path)
     ref_mask = cv2.cvtColor(ref_mask, cv2.COLOR_BGR2RGB)
+
+    # Optional DinoV3 encoder
+    use_dino = getattr(args, "feature_encoder", "sam") == "dinov3"
+    dino_extractor = None
+    dino_target_unit = None
+    if use_dino:
+        dinov3_model_name = getattr(args, "dinov3_model_name", None)
+        if not dinov3_model_name:
+            raise ValueError("Please provide --dinov3-model-name when enabling the DinoV3 feature encoder.")
+        precision = torch.float16 if getattr(args, "dinov3_precision", "fp32") == "fp16" else torch.float32
+        from .dinov3_encoder import DinoV3FeatureExtractor
+
+        dino_extractor = DinoV3FeatureExtractor(
+            model_name=dinov3_model_name,
+            image_size=getattr(args, "dinov3_image_size", 518),
+            output_size=getattr(args, "dinov3_output_size", 64),
+            device=device,
+            precision=precision,
+            pretrained=not getattr(args, "dinov3_no_pretrained", False),
+        )
+        dino_ref_feat = dino_extractor(ref_image)
+        dino_mask = _prepare_mask_from_image(
+            ref_mask,
+            (dino_ref_feat.shape[1], dino_ref_feat.shape[2]),
+            dino_extractor.device,
+        )
+        dino_target_vec = _aggregate_target_vector(
+            dino_ref_feat.permute(1, 2, 0),
+            dino_mask,
+            getattr(args, "feat_aggregation", "mean_max"),
+        )
+        if dino_target_vec is None:
+            raise ValueError("Reference mask is empty for DinoV3 features; cannot proceed.")
+        dino_target_unit = _normalize_vector(dino_target_vec.unsqueeze(0))
 
     # Image features encoding
     ref_mask = predictor.set_image(ref_image, ref_mask) # resize and padding
@@ -491,6 +582,7 @@ def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_
     C, h, w = test_feat.shape
     test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
     test_feat = test_feat.reshape(C, h * w)
+    dino_test_feat = None
     for n_clusters in range(args.min_num_pos, args.max_num_pos + 1):
         # Reference feature extraction
         target_feat = ref_feat[ref_mask > 0.0]
@@ -517,6 +609,26 @@ def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_
                         sim,
                         input_size=predictor.input_size,
                         original_size=predictor.original_size)
+
+        # Blend DinoV3 similarity if requested
+        if use_dino:
+            if dino_test_feat is None:
+                dino_test_feat = dino_extractor(test_image)
+            dino_sim = _compute_similarity(dino_target_unit, dino_test_feat)
+            dino_sim = F.interpolate(dino_sim, scale_factor=4, mode="bilinear", align_corners=False)
+            dino_sim = predictor.model.postprocess_masks(
+                dino_sim,
+                input_size=predictor.input_size,
+                original_size=predictor.original_size,
+            )
+            dino_sim_map = dino_sim.squeeze()
+            blend_weight = getattr(args, "dinov3_sim_weight", 0.5)
+            sim = (1 - blend_weight) * sim + blend_weight * dino_sim_map.unsqueeze(0).unsqueeze(0)
+
+        sim = sim * getattr(args, "dinov3_sim_gain", 1.0)
+        sim_threshold = getattr(args, "sim_threshold", None)
+        if sim_threshold is not None:
+            sim = torch.clamp(sim, min=sim_threshold)
         
         # Positive location prior
         method = "mean" if n_clusters == 1 else "max"
@@ -601,6 +713,14 @@ def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_
 
     # Save masks 
     mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
+    smoothing_method = getattr(args, "mask_smoothing", "none")
+    if smoothing_method != "none":
+        final_mask = _smooth_mask(
+            final_mask,
+            method=smoothing_method,
+            kernel_size=getattr(args, "mask_smoothing_kernel", 5),
+            sigma=getattr(args, "mask_smoothing_sigma", 1.0),
+        )
     mask_colors[final_mask, :] = np.array([[0, 0, 128]])
     mask_output_path = os.path.join(output_path, test_idx + '.png')
     cv2.imwrite(mask_output_path, mask_colors)
