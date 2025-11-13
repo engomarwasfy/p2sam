@@ -36,6 +36,13 @@ def get_arguments():
     parser.add_argument('--mask-smoothing', type=str, default='none', choices=['none', 'gaussian'])
     parser.add_argument('--mask-smoothing-kernel', type=int, default=5)
     parser.add_argument('--mask-smoothing-sigma', type=float, default=1.0)
+    parser.add_argument('--feat-aggregation', type=str, default='mean',
+                        choices=['mean', 'max', 'mean_max'],
+                        help='Feature aggregation strategy for target vector.')
+    parser.add_argument('--sim-threshold', type=float, default=None,
+                        help='Similarity threshold for filtering (None disables clipping).')
+    parser.add_argument('--box-padding', type=float, default=0.05,
+                        help='Relative padding factor for refinement boxes.')
 
     # vis for a specific case
     parser.add_argument('--vis', action='store_true')

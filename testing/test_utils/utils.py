@@ -34,6 +34,26 @@ def point_selection(mask_sim, topk=1):
     return topk_xy, topk_label, last_xy, last_label
 
 
+def aggregate_target_vector(feat_map, mask, method="mean_max"):
+    """
+    Aggregate the feature vectors within the positive mask region using the
+    requested strategy. Returns None if the mask has no positive pixels.
+    """
+    mask_bool = mask > 0
+    if mask_bool.sum() == 0:
+        return None
+    masked_feats = feat_map[mask_bool]
+    if method == "mean":
+        return masked_feats.mean(0)
+    if method == "max":
+        return torch.max(masked_feats, dim=0)[0]
+    if method == "mean_max":
+        feat_mean = masked_feats.mean(0)
+        feat_max = torch.max(masked_feats, dim=0)[0]
+        return 0.5 * feat_mean + 0.5 * feat_max
+    return masked_feats.mean(0)
+
+
 def smooth_mask(mask_array, method='none', kernel_size=5, sigma=1.0):
     if method == 'none':
         return mask_array
@@ -248,6 +268,14 @@ def run_medical(args, sam, test_image_path, test_mask_path, output_path, slice_n
             kernel_size=getattr(args, "mask_smoothing_kernel", 5),
             sigma=getattr(args, "mask_smoothing_sigma", 1.0),
         )
+    smoothing_method = getattr(args, "mask_smoothing", "none")
+    if smoothing_method != "none":
+        final_mask = smooth_mask(
+            final_mask,
+            method=smoothing_method,
+            kernel_size=getattr(args, "mask_smoothing_kernel", 5),
+            sigma=getattr(args, "mask_smoothing_sigma", 1.0),
+        )
     mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
     mask_colors[final_mask, :] = np.array([[0, 0, 128]])
     mask_output_path = os.path.join(output_path, slice_name + '.png')
@@ -274,6 +302,11 @@ def p2sam_medical(args, sam, ref_image_path, ref_mask_path, test_image_path, tes
 
     ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
     ref_mask = ref_mask.squeeze()[0]
+    agg_method = getattr(args, "feat_aggregation", "mean_max")
+    agg_target_vec = aggregate_target_vector(ref_feat, ref_mask, agg_method)
+    if agg_target_vec is None:
+        return None, None, None, None
+    target_embedding = agg_target_vec.unsqueeze(0).unsqueeze(0)
 
     # Save the patch-level reference feature
     ref_feats_reg_patch = ref_feat[ref_mask > 0.0]
@@ -331,6 +364,9 @@ def p2sam_medical(args, sam, ref_image_path, ref_mask_path, test_image_path, tes
                         sim,
                         input_size=predictor.input_size,
                         original_size=predictor.original_size)
+        sim_threshold = getattr(args, "sim_threshold", None)
+        if sim_threshold is not None:
+            sim = torch.clamp(sim, min=sim_threshold)
         
         # Positive location prior
         pos_select_method = "mean" if n_fore_clusters == 1 else "max"
@@ -466,6 +502,14 @@ def p2sam_medical(args, sam, ref_image_path, ref_mask_path, test_image_path, tes
                 final_point_labels = point_values_2
 
     # Save masks 
+    smoothing_method = getattr(args, "mask_smoothing", "none")
+    if smoothing_method != "none":
+        final_mask = smooth_mask(
+            final_mask,
+            method=smoothing_method,
+            kernel_size=getattr(args, "mask_smoothing_kernel", 5),
+            sigma=getattr(args, "mask_smoothing_sigma", 1.0),
+        )
     mask_colors = np.zeros((final_mask.shape[0], final_mask.shape[1], 3), dtype=np.uint8)
     mask_colors[final_mask, :] = np.array([[0, 0, 128]])
     mask_output_path = os.path.join(output_path, slice_name + '.png')
@@ -492,6 +536,11 @@ def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_
 
     ref_mask = F.interpolate(ref_mask, size=ref_feat.shape[0: 2], mode="bilinear")
     ref_mask = ref_mask.squeeze()[0]
+    agg_method = getattr(args, "feat_aggregation", "mean_max")
+    agg_target_vec = aggregate_target_vector(ref_feat, ref_mask, agg_method)
+    if agg_target_vec is None:
+        return None, None, None, None
+    target_embedding = agg_target_vec.unsqueeze(0).unsqueeze(0)
 
     # Save the patch-level reference feature
     ref_feats_reg_patch = ref_feat[ref_mask > 0.0]
@@ -515,7 +564,6 @@ def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_
     for n_clusters in range(args.min_num_pos, args.max_num_pos + 1):
         # Reference feature extraction
         target_feat = ref_feat[ref_mask > 0.0]
-        target_embedding = target_feat.mean(0).unsqueeze(0).unsqueeze(0)
         if n_clusters > 1:
             kmeans = KMeans(n_clusters=n_clusters, random_state=0)
             cluster = kmeans.fit_predict(target_feat.cpu().numpy())
@@ -586,10 +634,20 @@ def p2sam_perseg(args, sam, ref_image_path, ref_mask_path, test_idx, test_image_
 
         # Cascaded Post-refinement-2
         y, x = np.nonzero(masks[best_idx])
+        if len(x) == 0 or len(y) == 0:
+            continue
         x_min = x.min()
         x_max = x.max()
         y_min = y.min()
         y_max = y.max()
+        img_h, img_w = test_image.shape[:2]
+        padding_ratio = getattr(args, "box_padding", 0.05)
+        padding_x = int((x_max - x_min) * padding_ratio)
+        padding_y = int((y_max - y_min) * padding_ratio)
+        x_min = max(0, x_min - padding_x)
+        x_max = min(img_w - 1, x_max + padding_x)
+        y_min = max(0, y_min - padding_y)
+        y_max = min(img_h - 1, y_max + padding_y)
         input_box = np.array([x_min, y_min, x_max, y_max])
         masks, scores, logits, _, _, _ = predictor.predict(
             point_coords=topk_xy,
